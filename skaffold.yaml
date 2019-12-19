@@ -1,0 +1,6 @@
+apiVersion: skaffold/v1beta13
+kind: Config
+build:
+  artifacts:
+    - image: paulboutes/pboutes-demo-logging
+      jibGradle: {}

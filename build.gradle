@@ -1,20 +1,24 @@
+buildscript {
+    ext {
+        logbackVersion = '1.2.3';
+    }
+}
+
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.google.cloud.tools.jib' version '1.8.0'
+}
+
+
 group 'net.xeraa'
 version '1.0'
-
-apply plugin: 'java'
-apply plugin: 'application'
 
 sourceCompatibility = 1.8
 mainClassName = 'net.xeraa.logging.LogMe'
 
 repositories {
     mavenCentral()
-}
-
-buildscript {
-    ext {
-        logbackVersion = '1.2.3';
-    }
 }
 
 dependencies {
@@ -24,6 +28,12 @@ dependencies {
             "ch.qos.logback:logback-access:${logbackVersion}",
             "com.fasterxml.jackson.core:jackson-core:2.10.1",
             "net.logstash.logback:logstash-logback-encoder:6.3"
+}
+
+jib {
+    to {
+        image = 'docker.io/paulboutes/pboutes-demo-logging'
+    }
 }
 
 // Build a fat JAR and automatically run the main class in LogMe

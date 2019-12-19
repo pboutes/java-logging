@@ -1,0 +1,43 @@
+apiVersion: elasticsearch.k8s.elastic.co/v1beta1
+kind: Elasticsearch
+metadata:
+  name: elastic-monitor
+  namespace: default
+spec:
+  version: 7.4.0
+  nodeSets:
+  - name: default
+    count: 1
+    podTemplate:
+      metadata:
+        annotations:
+           "co.elastic.logs/module": elasticsearch
+      spec:
+    volumeClaimTemplates:
+    - metadata:
+        name: elasticsearch-data
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: kibana.k8s.elastic.co/v1beta1
+kind: Kibana
+metadata:
+  name: elastic-monitor
+  namespace: default
+spec:
+  version: 7.4.0
+  count: 1
+  elasticsearchRef:
+    name: elastic-monitor
+  podTemplate:
+    metadata:
+      annotations:
+        "co.elastic.logs/module": kibana
+  http:
+    service:
+      spec:
+        type: LoadBalancer

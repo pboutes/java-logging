@@ -1,0 +1,153 @@
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: log-pipeline
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: log-pipeline
+  template:
+    metadata:
+      labels:
+        app: log-pipeline
+    spec:
+      hostname: log-pipeline
+      containers:
+        - name: log-pipeline
+          ports:
+            - containerPort: 4560
+              name: ingest
+            - containerPort: 9600
+              name: api
+            - containerPort: 5044
+              name: ping
+          image: docker.elastic.co/logstash/logstash:7.5.0
+          volumeMounts:
+            - name: log-pipeline-config
+              mountPath: /usr/share/logstash/pipeline/
+            - name: es-certs
+              mountPath: /mnt/elastic/tls.crt
+              readOnly: true
+              subPath: tls.crt
+          command:
+            - logstash
+          env:
+          - name: ELASTICSEARCH_HOST
+            value: elastic-monitor-es-http
+          - name: ELASTICSEARCH_PORT
+            value: "9200"
+          - name: ELASTICSEARCH_USERNAME
+            value: elastic
+          - name: ELASTICSEARCH_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: elastic
+                name: elastic-monitor-es-elastic-user
+      volumes:
+        - name: log-pipeline-config
+          configMap:
+            name: log-pipeline
+            items:
+              - key: logstash.conf
+                path: logstash.conf
+        - name: es-certs
+          secret:
+            secretName: elastic-monitor-es-http-certs-public
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: logstash
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: log-pipeline
+  ports:
+    - protocol: TCP
+      port: 4560
+      name: ingest
+    - protocol: TCP
+      port: 5044
+      name: ping
+    - protocol: TCP
+      port: 9600
+      name: api
+
+---
+
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: log-pipeline
+  namespace: default
+data:
+  logstash.conf: |
+    input {
+      tcp {
+        port => 4560
+        codec => json_lines
+        add_field => {
+          logger => logstash
+        }
+      }
+      # beats {
+      #  port => 5044
+      # }
+    }
+
+    filter {
+      if [agent][hostname] == "filebeat_for_logstash" {
+
+        # Parse the message
+        grok {
+          match => {
+            message => "^\[%{TIMESTAMP_ISO8601:@timestamp}\]%{SPACE}%{LOGLEVEL:log.level}%{SPACE}%{USERNAME:log.package}%{SPACE}\[%{WORD:log.method}\]%{SPACE}-%{SPACE}%{GREEDYDATA:log.labels}%{SPACE}-%{SPACE}%{GREEDYDATA:message}(?:\n+(?<stacktrace>(?:.|\r|\n)+))?"
+          }
+        }
+
+        # Extract the MDC messages
+        kv {
+          source => "log.labels"
+          field_split => ","
+          trim_key => " "
+        }
+      } else {
+
+        # Rename fields in the Logstash output match the other mappings
+        mutate {
+          rename => {
+            level => "log.level"
+            thread_name => "log.method"
+            logger_name => "log.package"
+          }
+        }
+      }
+    }
+
+    output {
+      if [agent][hostname] == "filebeat_for_logstash" {
+        elasticsearch {
+          hosts => [ 'https://${ELASTICSEARCH_HOST:elasticsearch}:${ELASTICSEARCH_PORT:9200}' ]
+          ilm_rollover_alias => "parse"
+          ilm_pattern => "{now/M{yyyy.MM}}-00"
+          user => '${ELASTICSEARCH_USERNAME}'
+          password => '${ELASTICSEARCH_PASSWORD}'
+          ssl => true
+          cacert => '/mnt/elastic/tls.crt'
+        }
+      } else {
+        elasticsearch {
+          hosts => [ 'https://${ELASTICSEARCH_HOST:elasticsearch}:${ELASTICSEARCH_PORT:9200}' ]
+          ilm_rollover_alias => "send"
+          ilm_pattern => "{now/M{yyyy.MM}}-00"
+          user => '${ELASTICSEARCH_USERNAME}'
+          password => '${ELASTICSEARCH_PASSWORD}'
+          ssl => true
+          cacert => '/mnt/elastic/tls.crt'
+        }
+      }
+    }

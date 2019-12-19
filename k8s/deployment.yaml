@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: java-app
+  labels:
+    app: java-app
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      name: java-app
+      labels:
+        app: java-app
+      annotations:
+        co.elastic.logs/multiline.pattern: '^\['
+        co.elastic.logs/multiline.negate: 'true'
+        co.elastic.logs/multiline.match: after
+    spec:
+      containers:
+        - name: java-app
+          image: paulboutes/pboutes-demo-logging
+          imagePullPolicy: IfNotPresent
+      restartPolicy: Never

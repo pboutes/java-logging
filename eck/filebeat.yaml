@@ -1,0 +1,246 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: init-filebeat-config
+  namespace: default
+  labels:
+    k8s-app: filebeat
+data:
+  parse_java.json: |-
+    {
+      "description" : "Parse Java log lines",
+      "processors": [
+        {
+          "grok": {
+            "field": "message",
+            "patterns": [ "^\\[%{TIMESTAMP_ISO8601:timestamp}\\]%{SPACE}%{LOGLEVEL:log.level}%{SPACE}%{USERNAME:log.package}%{SPACE}\\[%{WORD:log.method}\\]%{SPACE}-%{SPACE}%{GREEDYDATA:log.labels}%{SPACE}-%{SPACE}%{GREEDYDATA:message_parsed}(?:\\n+(?<stacktrace>(?:.|\\r|\\n)+))?" ],
+            "ignore_failure": true
+          }
+        },
+        {
+          "kv": {
+            "field": "log.labels",
+            "field_split": ", ",
+            "value_split": "=",
+            "ignore_failure": true
+          }
+        }
+      ]
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elastic-monitor-filebeat-config
+  namespace: default
+  labels:
+    k8s-app: filebeat
+data:
+  filebeat.yml: |-
+    filebeat.autodiscover:
+      providers:
+        - type: kubernetes
+          host: ${NODE_NAME}
+          hints.enabled: false
+          include_annotations: '*'
+          templates:
+            - condition:
+                equals:
+                  kubernetes.container.name: java-app
+              config:
+                - type: container
+                  paths:
+                    - /var/lib/docker/containers/${data.kubernetes.container.id}/*.log
+                  multiline.pattern: '^\['
+                  multiline.negate: 'true'
+                  multiline.match: after
+                  pipeline: "parse_java"
+    
+    processors:
+      - add_kubernetes_metadata:
+          in_cluster: true
+      - add_cloud_metadata:
+      - add_host_metadata:
+
+    output.elasticsearch:
+      hosts: ['https://${ELASTICSEARCH_HOST:elasticsearch}:${ELASTICSEARCH_PORT:9200}']
+      username: ${ELASTICSEARCH_USERNAME}
+      password: ${ELASTICSEARCH_PASSWORD}
+      indices:
+        - index: "java-app"
+          when.contains:
+            kubernetes.container.name: java-app
+      ssl.certificate_authorities:
+      - /mnt/elastic/tls.crt
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: elastic-monitor-filebeat
+  namespace: default
+  labels:
+    k8s-app: filebeat
+spec:
+  selector:
+    matchLabels:
+      k8s-app: filebeat
+  template:
+    metadata:
+      labels:
+        k8s-app: filebeat
+    spec:
+      serviceAccountName: elastic-monitor-filebeat
+      terminationGracePeriodSeconds: 30
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: filebeat
+        image: docker.elastic.co/beats/filebeat:7.3.0
+        args: [
+          "-c", "/etc/filebeat.yml",
+          "-e",
+        ]
+        env:
+        - name: ELASTICSEARCH_HOST
+          value: elastic-monitor-es-http
+        - name: ELASTICSEARCH_PORT
+          value: "9200"
+        - name: ELASTICSEARCH_USERNAME
+          value: elastic
+        - name: ELASTICSEARCH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: elastic
+              name: elastic-monitor-es-elastic-user
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          runAsUser: 0
+          # If using Red Hat OpenShift uncomment this:
+          #privileged: true
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+        volumeMounts:
+        - name: config
+          mountPath: /etc/filebeat.yml
+          readOnly: true
+          subPath: filebeat.yml
+        - name: data
+          mountPath: /usr/share/filebeat/data
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+        - name: es-certs
+          mountPath: /mnt/elastic/tls.crt
+          readOnly: true
+          subPath: tls.crt
+      volumes:
+      - name: config
+        configMap:
+          defaultMode: 0600
+          name: elastic-monitor-filebeat-config
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: varlog
+        hostPath:
+          path: /var/log
+      # data folder stores a registry of read status for all files, so we don't send everything again on a Filebeat pod restart
+      - name: data
+        hostPath:
+          path: /var/lib/filebeat-data
+          type: DirectoryOrCreate
+      - name: es-certs
+        secret:
+          secretName: elastic-monitor-es-http-certs-public
+      - name: init-filebeat-config
+        configMap:
+          defaultMode: 0655
+          name: init-filebeat-config
+      initContainers:
+        - name: init-filebeat
+          image: curlimages/curl:7.67.0
+          env:
+            - name: ELASTICSEARCH_HOST
+              value: elastic-monitor-es-http
+            - name: ELASTICSEARCH_PORT
+              value: "9200"
+            - name: ELASTICSEARCH_USERNAME
+              value: elastic
+            - name: ELASTICSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: elastic
+                  name: elastic-monitor-es-elastic-user
+          volumeMounts:
+            - name: es-certs
+              mountPath: /mnt/elastic/tls.crt
+              readOnly: true
+              subPath: tls.crt
+            - name: init-filebeat-config
+              mountPath: /mnt/elastic/config/parse_java.json
+              readOnly: true
+              subPath: parse_java.json
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until $(curl --output /dev/null --silent -u "$ELASTICSEARCH_USERNAME:$ELASTICSEARCH_PASSWORD" --cacert "/mnt/elastic/tls.crt" "https://$ELASTICSEARCH_HOST:$ELASTICSEARCH_PORT/")
+              do
+                echo Waiting for https://$ELASTICSEARCH_HOST:$ELASTICSEARCH_PORT/_cat/health
+                sleep 5
+              done
+
+              # Add an ingest pipeline
+              curl -f -XPUT -H "Content-Type: application/json" -u "$ELASTICSEARCH_USERNAME:$ELASTICSEARCH_PASSWORD" --cacert "/mnt/elastic/tls.crt" "https://$ELASTICSEARCH_HOST:$ELASTICSEARCH_PORT/_ingest/pipeline/parse_java" \
+                -d @/mnt/elastic/config/parse_java.json
+
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: elastic-monitor-filebeat
+subjects:
+- kind: ServiceAccount
+  name: elastic-monitor-filebeat
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: elastic-monitor-filebeat
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: elastic-monitor-filebeat
+  labels:
+    k8s-app: filebeat
+rules:
+- apiGroups: [""] # "" indicates the core API group
+  resources:
+  - namespaces
+  - pods
+  verbs:
+  - get
+  - watch
+  - list
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: elastic-monitor-filebeat
+  namespace: default
+  labels:
+    k8s-app: filebeat
+---
